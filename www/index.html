@@ -20,6 +20,10 @@
   .tools button { background: rgba(0,0,0,.6); color: #eee; border: 1px solid #444; border-radius: 4px;
                   padding: 2px 7px; cursor: pointer; font-size: 14px; }
   .cell:fullscreen { background: #000; }
+  .recover { position: absolute; bottom: 8px; left: 8px; z-index: 1; font-size: 13px; display: none;
+             background: rgba(0,0,0,.65); border: 1px solid #a60; color: #fc6; padding: 2px 8px;
+             border-radius: 4px; pointer-events: none; }
+  .cell.recovering .recover { display: block; }
 
   /* Spotlight: one big tile on the left, the others as a strip on the right. */
   #grid.spot { grid-template-columns: 1fr 220px; grid-template-rows: repeat(var(--thumbs, 1), minmax(0, 1fr)); }
@@ -142,7 +146,62 @@
     vid.muted = true;
     vid.addEventListener('volumechange', () => syncMute(cam.id));
     syncMute(cam.id);
+    health.set(cam.id, { played: false, time: -1, moved: Date.now(), failures: health.get(cam.id)?.failures || 0 });
+    if (spot) syncSpotAudio();
   }
+
+  // Recovery: a tile can sit on "loading" or freeze when the Nest session drops or the browser
+  // stalls. Every 2s check that each visible video is advancing; if not, drop its <video-stream>
+  // and mount a new one after a backoff (5s, 10s, 20s, 40s, then 60s).
+  const health = new Map();
+  const FIRST_LOAD_MS = 20000, STALL_MS = 8000;
+
+  function restart(cam) {
+    const cell = cells.get(cam.id);
+    const st = health.get(cam.id);
+    st.failures++;
+    const wait = Math.min(5000 * 2 ** (st.failures - 1), 60000);
+    cell.querySelector('video-stream')?.remove();
+    health.delete(cam.id);
+    cell.classList.add('recovering');
+    cell.querySelector('.recover').textContent = `Reconnecting in ${wait / 1000}s (attempt ${st.failures})` +
+      (st.failures >= 3 ? ' - restart go2rtc if this persists' : '');
+    console.warn(`luna: ${cam.id} stalled, remounting in ${wait}ms`);
+    const t = setTimeout(() => {
+      pending.delete(cam.id);
+      if (hidden.has(cam.id)) return;
+      cell.querySelector('.recover').textContent = `Reconnecting (attempt ${st.failures})`;
+      mount(cam);
+      health.get(cam.id).failures = st.failures;
+    }, wait);
+    pending.set(cam.id, t);
+  }
+  const pending = new Map();
+
+  setInterval(() => {
+    if (document.hidden) return;
+    for (const cam of cameras) {
+      const st = health.get(cam.id);
+      const cell = cells.get(cam.id);
+      if (!st || hidden.has(cam.id)) continue;
+      const vid = cell.querySelector('video-stream')?.video;
+      if (!vid) continue;
+      if (vid.currentTime !== st.time) {
+        st.time = vid.currentTime;
+        st.moved = Date.now();
+        if (vid.currentTime > 0 && vid.readyState > 1) {
+          st.played = true;
+          st.failures = 0;
+          cell.classList.remove('recovering');
+        }
+        continue;
+      }
+      // A paused video is not a stall when it was blocked from unmuting; try playing it first.
+      if (vid.paused && vid.readyState > 1) { vid.muted = true; vid.play().catch(() => {}); }
+      const limit = st.played ? STALL_MS : FIRST_LOAD_MS;
+      if (Date.now() - st.moved > limit) restart(cam);
+    }
+  }, 2000);
 
   function syncMute(id) {
     const vid = cells.get(id).querySelector('video-stream')?.video;
@@ -204,6 +263,10 @@
       hidden.add(cam.id);
       cell.style.display = 'none';
       cell.querySelector('video-stream')?.remove();
+      clearTimeout(pending.get(cam.id));
+      pending.delete(cam.id);
+      health.delete(cam.id);
+      cell.classList.remove('recovering');
       if (spot === cam.id) setSpot(null);
     }
     save();
@@ -264,6 +327,9 @@
     label.className = 'label';
     label.textContent = cam.name;
     cell.appendChild(label);
+    const badge = document.createElement('div');
+    badge.className = 'recover';
+    cell.appendChild(badge);
 
     const tools = document.createElement('div');
     tools.className = 'tools';
