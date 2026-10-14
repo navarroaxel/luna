@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nest Cameras</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: sans-serif; }
+  #grid { display: grid; grid-template-columns: repeat(var(--cols, 3), 1fr); grid-template-rows: repeat(var(--rows, 2), 1fr);
+          gap: 4px; height: 100vh; padding: 4px; box-sizing: border-box; }
+  .cell { position: relative; background: #000; min-height: 0; overflow: hidden; cursor: pointer; }
+  .cell video-stream, .cell video { width: 100%; height: 100%; display: block; }
+  .cell video { object-fit: contain; }
+  .label { position: absolute; top: 6px; left: 8px; z-index: 1; font-size: 14px;
+           background: rgba(0,0,0,.55); padding: 2px 8px; border-radius: 4px; pointer-events: none; }
+  .tools { position: absolute; bottom: 8px; right: 8px; z-index: 2; display: flex; gap: 4px;
+           opacity: 0; transition: opacity .15s; }
+  .cell:hover .tools, .cell:fullscreen .tools { opacity: 1; }
+  @media (hover: none) { .tools { opacity: 1; } }
+  .tools button { background: rgba(0,0,0,.6); color: #eee; border: 1px solid #444; border-radius: 4px;
+                  padding: 2px 7px; cursor: pointer; font-size: 14px; }
+  .cell:fullscreen { background: #000; }
+
+  /* Spotlight: one big tile on the left, the others as a strip on the right. */
+  #grid.spot { grid-template-columns: 1fr 220px; grid-template-rows: repeat(var(--thumbs, 1), minmax(0, 1fr)); }
+  #grid.spot .cell.spot { grid-column: 1; grid-row: 1 / span var(--thumbs, 1); }
+  #grid.spot .cell:not(.spot) { grid-column: 2; }
+
+  #menu { position: fixed; top: 10px; right: 10px; z-index: 10; font-size: 14px; }
+  #menu button { background: rgba(0,0,0,.65); color: #eee; border: 1px solid #444; border-radius: 4px;
+                 padding: 4px 10px; cursor: pointer; font: inherit; }
+  #menu .panel { display: none; margin-top: 4px; background: rgba(20,20,20,.95); border: 1px solid #444;
+                 border-radius: 4px; padding: 6px 10px; }
+  #menu.open .panel { display: flex; flex-direction: column; }
+  #menu .row { display: flex; align-items: center; gap: 6px; }
+  #menu .row label { flex: 1; padding: 3px 0; cursor: pointer; white-space: nowrap; }
+  #menu .row button { padding: 0 6px; font-size: 12px; line-height: 18px; }
+  #menu .extra { border-top: 1px solid #444; margin-top: 4px; padding-top: 4px; }
+  #menu select { background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; font: inherit; }
+  #menu a { color: #8ab4f8; padding: 3px 0; }
+  .cell[draggable="true"] { cursor: grab; }
+  .cell.over { outline: 2px solid #4a9eff; outline-offset: -2px; }
+  #empty { display: none; position: fixed; inset: 0; align-items: center; justify-content: center; color: #888; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 20; background: rgba(0,0,0,.8);
+           border: 1px solid #444; border-radius: 4px; padding: 6px 14px; font-size: 14px; opacity: 0;
+           pointer-events: none; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+
+  /* Kiosk (?kiosk=1): no menu or buttons, cursor hides when idle. */
+  .kiosk #menu, .kiosk .tools { display: none; }
+  .idle, .idle * { cursor: none !important; }
+
+  @media (max-width: 800px) {
+    #grid { grid-template-columns: 1fr; grid-template-rows: none; height: auto; }
+    .cell { aspect-ratio: 16/9; }
+    #grid.spot { grid-template-columns: repeat(3, 1fr); grid-template-rows: none; }
+    #grid.spot .cell.spot { grid-column: 1 / -1; grid-row: auto; }
+    #grid.spot .cell:not(.spot) { grid-column: auto; }
+  }
+</style>
+</head>
+<body>
+<div id="menu">
+  <button type="button" id="menu-btn">Cameras</button>
+  <div class="panel" id="menu-panel"></div>
+</div>
+<div id="grid"></div>
+<div id="empty">No cameras selected</div>
+<div id="toast"></div>
+<script type="module" src="/video-stream.js"></script>
+<script type="module">
+  const STORE = 'luna.hidden';
+  const params = new URLSearchParams(location.search);
+  const kiosk = params.has('kiosk') && params.get('kiosk') !== '0';
+  const cameras = await (await fetch('cameras.json')).json();
+  const wsBase = location.origin.replace(/^http/, 'ws');
+  const grid = document.getElementById('grid');
+  const menu = document.getElementById('menu');
+  const panel = document.getElementById('menu-panel');
+
+  let hidden = new Set();
+  try { hidden = new Set(JSON.parse(localStorage.getItem(STORE) || '[]')); } catch {}
+  const save = () => { try { localStorage.setItem(STORE, JSON.stringify([...hidden])); } catch {} };
+
+  const cells = new Map();
+  const rows = new Map();
+  const muteBtns = new Map();
+
+  let toastTimer;
+  function toast(text) {
+    const el = document.getElementById('toast');
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
+  }
+
+  // Order is applied with CSS `order`, never by moving DOM nodes, because moving a
+  // <video-stream> would disconnect it and restart its stream.
+  const ORDER_STORE = 'luna.order';
+  let order = [];
+  try { order = JSON.parse(localStorage.getItem(ORDER_STORE) || '[]'); } catch {}
+  const ids = cameras.map(c => c.id);
+  order = [...new Set(order)].filter(id => ids.includes(id));
+  order.push(...ids.filter(id => !order.includes(id)));
+
+  let spot = null;
+
+  function paintOrder() {
+    order.forEach((id, i) => {
+      cells.get(id).style.order = id === spot ? -1 : i;
+      rows.get(id).style.order = i;
+    });
+  }
+
+  function applyOrder() {
+    paintOrder();
+    try { localStorage.setItem(ORDER_STORE, JSON.stringify(order)); } catch {}
+  }
+
+  function move(id, to) {
+    const from = order.indexOf(id);
+    if (from < 0 || to < 0 || to >= order.length || to === from) return;
+    order.splice(from, 1);
+    order.splice(to, 0, id);
+    applyOrder();
+  }
+
+  let dragId = null;
+
+  // Hidden cameras get no <video-stream> in the DOM, so go2rtc closes their upstream Nest session.
+  function mount(cam) {
+    const cell = cells.get(cam.id);
+    const v = document.createElement('video-stream');
+    v.mode = params.get('mode') || 'webrtc';
+    v.src = new URL(`api/ws?src=${cam.id}`, wsBase + '/');
+    cell.appendChild(v);
+    // The native controls would pause the live stream on every click and swallow the
+    // click that toggles the spotlight, so drop them and use the mute button instead.
+    const vid = v.video;
+    vid.controls = false;
+    vid.muted = true;
+    vid.addEventListener('volumechange', () => syncMute(cam.id));
+    syncMute(cam.id);
+  }
+
+  function syncMute(id) {
+    const vid = cells.get(id).querySelector('video-stream')?.video;
+    muteBtns.get(id).textContent = !vid || vid.muted ? '🔇' : '🔊';
+  }
+
+  function layout() {
+    const n = cameras.length - hidden.size;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+    grid.style.setProperty('--cols', cols);
+    grid.style.setProperty('--rows', Math.max(1, Math.ceil(n / cols)));
+    grid.style.setProperty('--thumbs', Math.max(1, n - 1));
+    document.getElementById('empty').style.display = n ? 'none' : 'flex';
+  }
+
+  function setSpot(id) {
+    spot = id;
+    grid.classList.toggle('spot', !!id);
+    for (const [cid, c] of cells) c.classList.toggle('spot', cid === id);
+    paintOrder();
+    syncSpotAudio();
+  }
+
+  // Only the spotlighted camera plays sound, whether it was picked by a click or by auto-cycle.
+  // Back in the grid everything is muted. Browsers refuse to unmute a video before the page has
+  // had a click or key press, in which case the video is paused. Detect that, go back to muted
+  // playback and unmute on the next click.
+  let audioBlocked = false;
+
+  function syncSpotAudio() {
+    for (const [id, cell] of cells) {
+      const vid = cell.querySelector('video-stream')?.video;
+      if (!vid) continue;
+      vid.muted = id !== spot;
+      if (id === spot && !vid.muted) {
+        setTimeout(() => {
+          if (vid.paused && vid.readyState > 1) {
+            vid.muted = true;
+            vid.play().catch(() => {});
+            audioBlocked = true;
+            toast('Click the page once to hear the selected camera');
+          }
+        }, 300);
+      }
+    }
+  }
+
+  document.addEventListener('click', () => {
+    if (audioBlocked) { audioBlocked = false; syncSpotAudio(); }
+  });
+
+  function setVisible(cam, show) {
+    const cell = cells.get(cam.id);
+    if (show) {
+      hidden.delete(cam.id);
+      cell.style.display = '';
+      mount(cam);
+    } else {
+      hidden.add(cam.id);
+      cell.style.display = 'none';
+      cell.querySelector('video-stream')?.remove();
+      if (spot === cam.id) setSpot(null);
+    }
+    save();
+    layout();
+  }
+
+  function snapshot(cam) {
+    const vid = cells.get(cam.id).querySelector('video-stream')?.video;
+    if (!vid || !vid.videoWidth) return toast('No video yet');
+    const canvas = document.createElement('canvas');
+    canvas.width = vid.videoWidth;
+    canvas.height = vid.videoHeight;
+    canvas.getContext('2d').drawImage(vid, 0, 0);
+    canvas.toBlob(blob => {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${cam.name.replace(/\W+/g, '-')}-${stamp}.jpg`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      toast(`Saved ${cam.name} snapshot`);
+    }, 'image/jpeg', 0.92);
+  }
+
+  // Auto-cycle: spotlight each visible camera in turn. ?cycle=<seconds> overrides the saved setting.
+  const CYCLE_STORE = 'luna.cycle';
+  let cycle = { on: false, sec: 10 };
+  try { cycle = { ...cycle, ...JSON.parse(localStorage.getItem(CYCLE_STORE) || '{}') }; } catch {}
+  const urlCycle = Number(params.get('cycle'));
+  if (urlCycle > 0) cycle = { on: true, sec: urlCycle };
+  let cycleTimer = null;
+  let cycleBox, cycleSel;
+
+  function stepCycle() {
+    const visible = order.filter(id => !hidden.has(id));
+    if (visible.length < 2) return;
+    setSpot(visible[(visible.indexOf(spot) + 1) % visible.length]);
+  }
+
+  function setCycle(patch, persist = true) {
+    cycle = { ...cycle, ...patch };
+    cycleBox.checked = cycle.on;
+    cycleSel.value = String(cycle.sec);
+    clearInterval(cycleTimer);
+    cycleTimer = cycle.on ? setInterval(stepCycle, cycle.sec * 1000) : null;
+    if (persist) try { localStorage.setItem(CYCLE_STORE, JSON.stringify(cycle)); } catch {}
+  }
+
+  function exitSpot() {
+    setSpot(null);
+    if (cycle.on) setCycle({ on: false }, !urlCycle);
+  }
+
+  for (const cam of cameras) {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = cam.name;
+    cell.appendChild(label);
+
+    const tools = document.createElement('div');
+    tools.className = 'tools';
+    const toolBtn = (text, title, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.title = title;
+      b.addEventListener('click', e => { e.stopPropagation(); fn(); });
+      tools.appendChild(b);
+      return b;
+    };
+    muteBtns.set(cam.id, toolBtn('🔇', 'Mute / unmute', () => {
+      const vid = cell.querySelector('video-stream')?.video;
+      if (vid) vid.muted = !vid.muted;
+    }));
+    toolBtn('📷', 'Save snapshot', () => snapshot(cam));
+    toolBtn('⛶', 'Fullscreen', () =>
+      document.fullscreenElement ? document.exitFullscreen() : cell.requestFullscreen());
+    cell.appendChild(tools);
+
+    cell.addEventListener('click', () => {
+      if (spot === cam.id) exitSpot();
+      else { setSpot(cam.id); if (cycle.on) setCycle({}, false); }
+    });
+
+    cell.draggable = !kiosk;
+    cell.addEventListener('dragstart', e => {
+      dragId = cam.id;
+      e.dataTransfer.setData('text/plain', cam.id);
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    cell.addEventListener('dragover', e => {
+      if (dragId && dragId !== cam.id) { e.preventDefault(); cell.classList.add('over'); }
+    });
+    cell.addEventListener('dragleave', () => cell.classList.remove('over'));
+    cell.addEventListener('drop', e => {
+      e.preventDefault();
+      cell.classList.remove('over');
+      if (dragId) move(dragId, order.indexOf(cam.id));
+    });
+    cell.addEventListener('dragend', () => {
+      dragId = null;
+      for (const c of cells.values()) c.classList.remove('over');
+    });
+    grid.appendChild(cell);
+    cells.set(cam.id, cell);
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    const name = document.createElement('label');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !hidden.has(cam.id);
+    box.addEventListener('change', () => setVisible(cam, box.checked));
+    name.append(box, ' ', cam.name);
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.textContent = '▲';
+    up.title = 'Move earlier';
+    up.addEventListener('click', () => move(cam.id, order.indexOf(cam.id) - 1));
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.textContent = '▼';
+    down.title = 'Move later';
+    down.addEventListener('click', () => move(cam.id, order.indexOf(cam.id) + 1));
+    row.append(name, up, down);
+    panel.appendChild(row);
+    rows.set(cam.id, row);
+
+    if (hidden.has(cam.id)) cell.style.display = 'none'; else mount(cam);
+  }
+
+  // Menu extras: auto-cycle and a link to the kiosk view. `order` keeps them below the camera rows.
+  const cycleRow = document.createElement('div');
+  cycleRow.className = 'row extra';
+  cycleRow.style.order = 1000;
+  const cycleLabel = document.createElement('label');
+  cycleBox = document.createElement('input');
+  cycleBox.type = 'checkbox';
+  cycleLabel.append(cycleBox, ' Auto-cycle');
+  cycleSel = document.createElement('select');
+  for (const s of [...new Set([5, 10, 20, 30, 60, cycle.sec])].sort((a, b) => a - b)) {
+    const o = document.createElement('option');
+    o.value = String(s);
+    o.textContent = `${s}s`;
+    cycleSel.appendChild(o);
+  }
+  cycleBox.addEventListener('change', () => {
+    setCycle({ on: cycleBox.checked, sec: Number(cycleSel.value) });
+    if (cycleBox.checked) stepCycle();
+  });
+  cycleSel.addEventListener('change', () => setCycle({ sec: Number(cycleSel.value) }));
+  cycleRow.append(cycleLabel, cycleSel);
+  panel.appendChild(cycleRow);
+
+  const kioskLink = document.createElement('a');
+  const kioskUrl = new URL(location.href);
+  kioskUrl.searchParams.set('kiosk', '1');
+  kioskLink.href = kioskUrl;
+  kioskLink.textContent = 'Open kiosk view';
+  kioskLink.style.order = 1001;
+  panel.appendChild(kioskLink);
+
+  applyOrder();
+  layout();
+  setCycle({}, false);
+  if (urlCycle > 0) stepCycle();
+
+  document.getElementById('menu-btn').addEventListener('click', () => menu.classList.toggle('open'));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && spot) exitSpot(); });
+
+  if (kiosk) {
+    document.body.classList.add('kiosk');
+
+    // Hide the cursor after 3s without movement.
+    let idleTimer;
+    const wake = () => {
+      document.body.classList.remove('idle');
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => document.body.classList.add('idle'), 3000);
+    };
+    document.addEventListener('mousemove', wake);
+    wake();
+
+    // Keep the screen on. Only works in a secure context (https or localhost).
+    const keepAwake = () => navigator.wakeLock?.request('screen').catch(() => {});
+    keepAwake();
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) keepAwake(); });
+
+    // A wall display runs for days, so start from a clean page now and then.
+    setTimeout(() => location.reload(), 6 * 3600 * 1000);
+  }
+</script>
+</body>
+</html>

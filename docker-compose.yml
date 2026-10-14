@@ -1,0 +1,10 @@
+services:
+  go2rtc:
+    image: alexxit/go2rtc:master
+    container_name: go2rtc
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml
+      - ./www:/www
+      - ./cameras.json:/www/cameras.json:ro

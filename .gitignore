@@ -1,0 +1,5 @@
+.env
+go2rtc.yaml
+cameras.json
+www/cameras.json
+site/
